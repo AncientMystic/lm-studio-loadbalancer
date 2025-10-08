@@ -1,0 +1,51 @@
+{
+  "name": "lm-studio-loadbalancer",
+  "version": "1.0.0",
+  "description": "An intelligent load balancer for LM Studio that distributes requests across multiple loaded language models",
+  "main": "server.js",
+  "keywords": [
+    "lm-studio",
+    "load-balancer",
+    "llm",
+    "ai",
+    "proxy",
+    "nodejs",
+    "express"
+  ],
+  "author": {
+    "name": "LM Studio Load Balancer Contributors",
+    "url": "https://github.com/autolocalize/lm-studio-loadbalancer"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/autolocalize/lm-studio-loadbalancer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/autolocalize/lm-studio-loadbalancer/issues"
+  },
+  "homepage": "https://github.com/autolocalize/lm-studio-loadbalancer#readme",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node test.js",
+    "lint": "echo 'No linter configured'",
+    "format": "echo 'No formatter configured'"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "express-http-proxy": "^1.6.3",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {},
+  "files": [
+    "server.js",
+    "test.js",
+    "README.md",
+    "LICENSE"
+  ]
+}
