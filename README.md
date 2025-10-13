@@ -8,6 +8,10 @@
 
 An intelligent load balancer for LM Studio that distributes requests across multiple loaded language models, optimizing resource utilization and response times.
 
+If you make multiple requests to a single model loaded in LM Studio, it will queue the requests. However, if your computer has sufficient VRAM, you can load multiple instances of the same model. You can also send simultaneous requests to loaded models with different names. This Load Balancer app manages requests by changing the model name in the request, ensuring it is routed to an idle model instance. This allows you to serve multiple requests at the same time.
+
+![image](./LMStudio.png)
+
 ## 🚀 Features
 
 - **Intelligent Load Balancing**: Automatically distributes requests across available models based on current load
@@ -23,6 +27,8 @@ An intelligent load balancer for LM Studio that distributes requests across mult
 - [Node.js](https://nodejs.org/) (version 14 or higher)
 - [LM Studio](https://lmstudio.ai/) running on `localhost:1234`
 - At least one model loaded in LM Studio
+
+
 
 ## 🛠️ Installation
 
