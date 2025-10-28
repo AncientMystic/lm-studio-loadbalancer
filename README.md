@@ -1,3 +1,9 @@
+this is a fork of lm-studio load balancer. 
+
+in this changed version, requests are now distributed across all loaded models, specifically for use with embedding, so the requests will be distributed across all of the same models loaded multiple times as name:#. tested by loading 5 of the same embedding model. 
+
+(i am not much of a coder, this is probably messy, but it works)
+
 # LM Studio Load Balancer
 
 [![npm version](https://badge.fury.io/js/lm-studio-loadbalancer.svg)](https://badge.fury.io/js/lm-studio-loadbalancer)
