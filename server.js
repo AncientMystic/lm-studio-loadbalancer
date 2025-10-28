@@ -45,7 +45,8 @@ app.use(express.raw({ limit: config.MAX_PAYLOAD_SIZE, type: 'text/plain' }));
 // State management
 let availableModels = [];
 let inProgressModels = []; // Array to track multiple requests per model
-let modelIndex = 0;
+let modelIndex = 0; // Initialize modelIndex
+let requestQueue = []; // Request queue to hold pending requests
 
 /**
  * Loads available models from LM Studio API
@@ -56,15 +57,13 @@ async function loadModels() {
     const response = await axios.get(`${config.LM_STUDIO_URL}/api/v0/models`, {
       timeout: config.REQUEST_TIMEOUT
     });
-    
+
     const previousCount = availableModels.length;
+    // Include all model instances, not just those without ':#' in the name
     availableModels = response.data.data.filter(model => model.state === 'loaded');
-    
-    if (availableModels.length !== previousCount) {
-      logger.info(`Loaded models: [${availableModels.map(m => m.id).join(', ')}]`);
-      logger.info(`Total loaded models: ${availableModels.length}`);
-    }
-    
+    logger.info(`Loaded models: [${availableModels.map(m => m.id).join(', ')}]`);
+    logger.info(`Total loaded models: ${availableModels.length}`);
+
     return availableModels;
   } catch (error) {
     logger.error('Failed to load models from LM Studio:', error.message);
@@ -81,7 +80,7 @@ async function loadModels() {
  */
 function startModelUpdater() {
   logger.debug(`Starting model updater with ${config.MODEL_REFRESH_INTERVAL}ms interval`);
-  
+
   setInterval(async () => {
     logger.debug('Updating model list...');
     await loadModels();
@@ -89,7 +88,7 @@ function startModelUpdater() {
     // Clean up inProgressModels that are no longer available
     const availableModelIds = new Set(availableModels.map(m => m.id));
     const initialLength = inProgressModels.length;
-    
+
     inProgressModels = inProgressModels.filter(modelId => {
       if (!availableModelIds.has(modelId)) {
         logger.warn(`Cleaned up unavailable model: ${modelId}`);
@@ -101,6 +100,8 @@ function startModelUpdater() {
     if (inProgressModels.length < initialLength) {
       logger.info(`Cleaned up ${initialLength - inProgressModels.length} unavailable models`);
     }
+
+    processRequestQueue(); // Process the request queue
 
     logger.debug(`Model update completed. Available models: ${availableModels.length}`);
   }, config.MODEL_REFRESH_INTERVAL);
@@ -122,7 +123,7 @@ function selectModel() {
     modelRequestCounts[modelId] = (modelRequestCounts[modelId] || 0) + 1;
   });
 
-  // Find model with least in-progress requests
+  // Find the model with the least in-progress requests
   let selectedModel = null;
   let minRequests = Infinity;
 
@@ -132,6 +133,17 @@ function selectModel() {
       minRequests = requestCount;
       selectedModel = model;
     }
+  }
+
+  // If multiple models have the same minimum requests, distribute evenly
+  const candidates = availableModels.filter(model => {
+    const requestCount = modelRequestCounts[model.id] || 0;
+    return requestCount === minRequests;
+  });
+
+  if (candidates.length > 1) {
+    // Rotate selection to distribute requests evenly
+    selectedModel = candidates[(modelIndex++) % candidates.length];
   }
 
   logger.debug(`Selected model ${selectedModel.id} with ${minRequests} in-progress requests`);
@@ -199,7 +211,48 @@ function modifyRequestBody(bodyContent, srcReq) {
   }
 }
 
+function processRequestQueue() {
+  while (requestQueue.length > 0 && availableModels.length > 0) {
+    const req = requestQueue.shift();
+    try {
+      const selectedModel = selectModel();
+      inProgressModels.push(selectedModel.id);
+      req.selectedModel = selectedModel.id;
+      proxy(config.LM_STUDIO_URL, {
+        proxyReqBodyDecorator: (bodyContent, srcReq) => {
+          const modifiedBody = modifyRequestBody(bodyContent, srcReq);
+          if (config.ENABLE_REQUEST_LOGGING) {
+            logger.info(`Request URL: ${srcReq.url}`);
+          }
+          return modifiedBody;
+        },
+        proxyReqOptDecorator: (proxyReqOpts, srcReq) => {
+          // Preserve headers for streaming
+          proxyReqOpts.headers['Accept'] = 'text/event-stream';
+          proxyReqOpts.headers['Cache-Control'] = 'no-cache';
+          proxyReqOpts.headers['Connection'] = 'keep-alive';
 
+          // Remove Content-Length header to let proxy calculate it automatically
+          delete proxyReqOpts.headers['content-length'];
+
+          // Set timeout for large requests
+          proxyReqOpts.timeout = config.REQUEST_TIMEOUT;
+
+          return proxyReqOpts;
+        },
+      })(req, {}, (err) => {
+        if (err) {
+          logger.error('Proxy error:', err.message);
+        }
+        const modelToRelease = req.selectedModel;
+        inProgressModels.splice(inProgressModels.indexOf(modelToRelease), 1);
+      });
+    } catch (error) {
+      logger.error('Failed to process request from queue:', error.message);
+      requestQueue.unshift(req); // Put the request back in the queue if it fails
+    }
+  }
+}
 
 // Health check endpoint
 app.get('/health', (req, res) => {
