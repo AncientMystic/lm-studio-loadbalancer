@@ -1,8 +1,8 @@
 this is a fork of lm-studio load balancer. 
 
-in this changed version, requests are now distributed across all loaded models, specifically for use with embedding, so the requests will be distributed across all of the same models loaded multiple times as name:#. tested by loading 5 of the same embedding model. 
+in this changed version, requests are now distributed across all loaded embedding models, so this version is specifically for use as a proxy for embedding, so the requests will be distributed across all of the same embedding models multiple times as name:#. tested by loading 5 of the same embedding model. it has also been updated currently to ignore other models loaded and not send embedding requests to non-embedding models by mistake. 
 
-(i am not much of a coder, this is probably messy, but it works)
+( i edited this specifically for use with the obsidian plugin "PrivateAI" which allows seperate settings for embed and chat models, still working on the differentiation between embedding and others so it can be used as a single endpoint to relay all requests to lm-studio. but i am not much of a coder, this is probably messy, but it works)
 
 # LM Studio Load Balancer
 
