@@ -1,13 +1,13 @@
+// ---- 1.  Imports & config ----------------------------------------------------
 const express = require('express');
-const proxy = require('express-http-proxy');
-const axios = require('axios');
+const proxy   = require('express-http-proxy');
+const axios   = require('axios');
 
-// Load environment variables
 require('dotenv').config();
 
 const app = express();
 
-// Configuration from environment variables with defaults
+// Environment variables (typos kept for backward‑compatibility)
 const config = {
   LM_STUDIO_URL: process.env.LM_STUDIO_URL || 'http://localhost:1234',
   LOAD_BALANCER_PORT: parseInt(process.env.LOAD_BALANCER_PORT) || 4321,
@@ -18,38 +18,38 @@ const config = {
   ENABLE_REQUEST_LOGGING: process.env.ENABLE_REQUEST_LOGGING === 'true'
 };
 
-// Logging utility
+// ---- 2. Logging ------------------------------------------------------------
 const logger = {
-  error: (message, ...args) => console.error(`[ERROR] ${new Date().toISOString()}: ${message}`, ...args),
-  warn: (message, ...args) => console.warn(`[WARN] ${new Date().toISOString()}: ${message}`, ...args),
-  info: (message, ...args) => {
+  error: (msg, ...a) => console.error(`[ERROR] ${new Date().toISOString()}: ${msg}`, ...a),
+  warn:  (msg, ...a) => console.warn(`[WARN ] ${new Date().toISOString()}: ${msg}`, ...a),
+  info:  (msg, ...a) => {
     if (config.LOG_LEVEL === 'info' || config.LOG_LEVEL === 'debug') {
-      console.info(`[INFO] ${new Date().toISOString()}: ${message}`, ...args);
+      console.info(`[INFO ] ${new Date().toISOString()}: ${msg}`, ...a);
     }
   },
-  debug: (message, ...args) => {
+  debug: (msg, ...a) => {
     if (config.LOG_LEVEL === 'debug') {
-      console.debug(`[DEBUG] ${new Date().toISOString()}: ${message}`, ...args);
+      console.debug(`[DEBUG] ${new Date().toISOString()}: ${msg}`, ...a);
     }
   }
 };
 
-// Configure Express to handle large payloads
+// ---- 3. Express payload limits -----------------------------------------
 app.use(express.json({ limit: config.MAX_PAYLOAD_SIZE }));
 app.use(express.urlencoded({ extended: true, limit: config.MAX_PAYLOAD_SIZE }));
-
-// Increase payload size limit for raw body parser
 app.use(express.raw({ limit: config.MAX_PAYLOAD_SIZE, type: 'application/json' }));
 app.use(express.raw({ limit: config.MAX_PAYLOAD_SIZE, type: 'text/plain' }));
 
-// State management
-let availableModels = [];
-let inProgressModels = []; // Array to track multiple requests per model
-let modelIndex = 0; // Initialize modelIndex
+// ---- 4. State -------------------------------------------------------------
+let availableModels = [];          // only embedding models
+let inProgressModels = [];   // ids of models currently busy
+let modelIndex = 0;           // for round‑robin
+let requestQueue = [];      // queued requests while we are still bootstrapping
 
+// ---- 5. Load the list of loaded models ---------------------------------
 /**
- * Loads available models from LM Studio API
- * @returns {Promise<Array>} Array of loaded models with instance counts
+ * Loads available (embedding) models from LM Studio API.
+ * @returns {Promise<Array>}
  */
 async function loadModels() {
   try {
@@ -57,244 +57,210 @@ async function loadModels() {
       timeout: config.REQUEST_TIMEOUT
     });
 
-    const previousCount = availableModels.length;
-    availableModels = response.data.data.filter(model => model.state === 'loaded').map(model => ({
-      ...model,
-      count: response.data.data.filter(m => m.id.startsWith(`${model.id}:`)).length  // Count instances of the same model
-    }));
+    // Keep only loaded embedding models – the id must contain 'text-embedding'
+    availableModels = response.data.data.filter(
+      m => m.state === 'loaded' && /text-embedding/.test(m.id)
+    );
 
-    if (availableModels.length !== previousCount) {
-      logger.info(`Loaded models: [${availableModels.map(m => m.id).join(', ')}]`);
-      logger.info(`Total loaded models: ${availableModels.length}`);
-    }
+    logger.info(`Loaded embedding models: [${availableModels.map(m => m.id).join(', ')}]`);
+    logger.debug(`Total loaded embedding models: ${availableModels.length}`);
 
     return availableModels;
-  } catch (error) {
-    logger.error('Failed to load models from LM Studio:', error.message);
-    if (error.code === 'ECONNREFUSED') {
+  } catch (err) {
+    logger.error('Failed to load models from LM Studio:', err.message);
+    if (err.code === 'ECONNREFUSED') {
       logger.error('LM Studio is not running or not accessible');
     }
-    availableModels = []; // Set to empty array instead of exiting
+    availableModels = [];
     return [];
   }
 }
 
-
-/**
- * Starts the periodic model update process
- */
+// ---- 6. Periodic refresh -------------------------------------------------
 function startModelUpdater() {
   logger.debug(`Starting model updater with ${config.MODEL_REFRESH_INTERVAL}ms interval`);
-  
   setInterval(async () => {
-    logger.debug('Updating model list...');
+    logger.debug('Refreshing model list...');
     await loadModels();
 
-    // Clean up inProgressModels that are no longer available
-    const availableModelIds = new Set(availableModels.map(m => m.id));
-    const initialLength = inProgressModels.length;
-    
-    inProgressModels = inProgressModels.filter(modelId => {
-      if (!availableModelIds.has(modelId)) {
-        logger.warn(`Cleaned up unavailable model: ${modelId}`);
+    // Remove stale in‑progress entries
+    const availIds = new Set(availableModels.map(m => m.id));
+    const oldLen   = inProgressModels.length;
+    inProgressModels = inProgressModels.filter(id => {
+      if (!availIds.has(id)) {
+        logger.warn(`Removed unavailable model from queue: ${id}`);
         return false;
       }
       return true;
     });
 
-    if (inProgressModels.length < initialLength) {
-      logger.info(`Cleaned up ${initialLength - inProgressModels.length} unavailable models`);
+    if (inProgressModels.length < oldLen) {
+      logger.info(`Cleaned up ${oldLen - inProgressModels.length} unavailable models`);
     }
 
-    logger.debug(`Model update completed. Available models: ${availableModels.length}`);
+    // If we have requests queued while we had no embedding models, try to dispatch them now
+    processRequestQueue();
   }, config.MODEL_REFRESH_INTERVAL);
 }
 
+// ---- 7. Model selection --------------------------------------------------
 /**
- * Selects the best available model based on current load
- * @returns {Object} Selected model object
- * @throws {Error} If no models available
+ * Pick the least‑used embedding model.
  */
 function selectModel() {
-  if (availableModels.length === 0) {
-    throw new Error('No models available');
+  if (!availableModels.length) throw new Error('No embedding models available');
+
+  // Count in‑progress per id
+  const counts = {};
+  inProgressModels.forEach(id => { counts[id] = (counts[id] || 0) + 1; });
+
+  let best   = null;
+  let minReq = Infinity;
+
+  for (const m of availableModels) {
+    const c = counts[m.id] ?? 0;
+    if (c < minReq) { minReq = c; best = m; }
   }
 
-  // Count in-progress requests for each model instance
-  const modelRequestCounts = {};
-  inProgressModels.forEach(modelId => {
-    modelRequestCounts[modelId] = (modelRequestCounts[modelId] || 0) + 1;
-  });
-
-  // Find model instance with least in-progress requests
-  let selectedModelInstance = null;
-  let minRequests = Infinity;
-
-  for (const model of availableModels) {
-    const instanceId = `${model.id}:${modelIndex % model.count}`;
-    const requestCount = modelRequestCounts[instanceId] || 0;
-    if (requestCount < minRequests) {
-      minRequests = requestCount;
-      selectedModelInstance = instanceId;
-    }
-    // Increment the index for the next model selection
-    modelIndex++;
+  // If a tie – rotate round‑robin
+  const ties = availableModels.filter(m => (counts[m.id] ?? 0) === minReq);
+  if (ties.length > 1) {
+    best = ties[(modelIndex++) % ties.length];
   }
 
-  logger.debug(`Selected model instance ${selectedModelInstance} with ${minRequests} in-progress requests`);
-  return { id: selectedModelInstance };
+  logger.debug(`Selected model ${best.id} (in‑progress: ${minReq})`);
+  return best;
 }
 
-
+// ---- 8. Modify request body ----------------------------------------------
 /**
- * Modifies request body to replace model with load-balanced selection
- * @param {string|Object} bodyContent - Request body content
- * @param {Object} srcReq - Source request object
- * @returns {string} Modified request body as JSON string
+ * Replace the model id in the request body with a load‑balanced one.
  */
 function modifyRequestBody(bodyContent, srcReq) {
   if (!bodyContent || bodyContent.length === 0) return bodyContent;
 
   try {
     let body;
-
-    // Check if bodyContent is already a parsed object
     if (typeof bodyContent === 'object' && bodyContent !== null) {
-      body = bodyContent;
+      body = bodyContent;              // already parsed
     } else {
-      // If it's a string or Buffer, parse it as JSON
-      const bodyString = bodyContent.toString();
-      body = JSON.parse(bodyString);
+      const s = bodyContent.toString();
+      body = JSON.parse(s);
     }
 
-    if (availableModels.length > 0 && body.model) {
-      const selectedModel = selectModel();
-      const originalModel = body.model;
+    if (body.model && availableModels.length > 0) {
+      const chosen = selectModel();
 
-      // Store the selected model in the request object for later cleanup
-      srcReq.selectedModel = selectedModel.id;
+      srcReq.selectedModel = chosen.id;
+      inProgressModels.push(chosen.id);
 
-      // Mark model as in progress
-      inProgressModels.push(selectedModel.id);
+      // Replace the model
+      const orig = body.model;
+      body.model = chosen.id;
 
-      // Replace model in request body
-      body.model = selectedModel.id;
-      
-      logger.info(`Selected model: ${selectedModel.id} (replaced from ${originalModel})`);
-      logger.debug(`In-progress models: [${inProgressModels.join(', ')}]`);
-
-      // Return the modified body as JSON string
+      logger.info(`Replaced model ${orig} → ${chosen.id}`);
       return JSON.stringify(body);
     }
 
-    // If no model replacement needed, return original body
+    // No replacement – just return whatever we had
     if (typeof bodyContent === 'object' && bodyContent !== null) {
       return JSON.stringify(bodyContent);
-    } else {
-      return bodyContent.toString();
     }
-  } catch (error) {
-    logger.error('Error processing request body:', error.message);
-    logger.debug('Body content type:', typeof bodyContent);
-    logger.debug('Body content:', bodyContent);
+    return bodyContent.toString();
+  } catch (err) {
+    logger.error('Body‑parse error:', err.message);
+    return typeof bodyContent === 'object' ? JSON.stringify(bodyContent) : bodyContent.toString();
+  }
+}
 
-    // Return original body if there's an error
-    if (typeof bodyContent === 'object' && bodyContent !== null) {
-      return JSON.stringify(bodyContent);
-    } else {
-      return bodyContent.toString();
+// ---- 9. Process queued requests ------------------------------------------
+function processRequestQueue() {
+  while (requestQueue.length > 0 && availableModels.length > 0) {
+    const req = requestQueue.shift();
+    try {
+      const chosen = selectModel();
+
+      inProgressModels.push(chosen.id);
+      req.selectedModel = chosen.id;
+
+      proxy(config.LM_STUDIO_URL, {
+        proxyReqBodyDecorator: (body, src) => {
+          const mod = modifyRequestBody(body, src);
+          if (config.ENABLE_REQUEST_LOGGING) logger.info(`Proxying ${src.url}`);
+          return mod;
+        },
+        proxyReqOptDecorator: (opts, src) => {
+          opts.headers['Accept']            = 'text/event-stream';
+          opts.headers['Cache-Control']     = 'no-cache';
+          opts.headers['Connection']        = 'keep-alive';
+          delete opts.headers['content-length'];
+          opts.timeout = config.REQUEST_TIMEOUT;
+          return opts;
+        }
+      })(req, {}, (err) => {
+        if (err) logger.error('Proxy error:', err.message);
+        const rel = req.selectedModel;
+        inProgressModels.splice(inProgressModels.indexOf(rel), 1);
+      });
+    } catch (e) {
+      logger.error('Failed to dispatch queued request:', e.message);
+      // Re‑queue it
+      requestQueue.unshift(req);
     }
   }
 }
 
-
-
-// Health check endpoint
+// ---- 10. Health & status endpoints --------------------------------------
 app.get('/health', (req, res) => {
   try {
     res.json({
       status: 'healthy',
       availableModels: availableModels.map(m => m.id),
-      inProgressModels: Array.from(inProgressModels),
+      inProgressModels,
       totalRequests: modelIndex,
       uptime: process.uptime(),
       memory: process.memoryUsage()
     });
-  } catch (error) {
-    logger.error('Health check error:', error.message);
-    res.status(500).json({ status: 'error', message: error.message });
-  }
+  } catch (e) { logger.error('Health check failed:', e.message); res.status(500).json({ status:'error', message:e.message }); }
 });
 
-// Model status endpoint
 app.get('/models', (req, res) => {
   try {
-    // Count in-progress requests for each model
-    const modelRequestCounts = {};
-    inProgressModels.forEach(modelId => {
-      modelRequestCounts[modelId] = (modelRequestCounts[modelId] || 0) + 1;
-    });
+    const counts = {};
+    inProgressModels.forEach(id => { counts[id] = (counts[id] ?? 0) + 1; });
 
     res.json({
       availableModels: availableModels.map(m => m.id),
-      inProgressModels: inProgressModels,
-      freeModels: availableModels.filter(m => !modelRequestCounts[m.id]).map(m => m.id),
-      modelLoad: modelRequestCounts
+      inProgressModels,
+      freeModels: availableModels.filter(m => !counts[m.id]).map(m => m.id),
+      modelLoad: counts
     });
-  } catch (error) {
-    logger.error('Models endpoint error:', error.message);
-    res.status(500).json({ error: 'Failed to get model status', message: error.message });
-  }
+  } catch (e) { logger.error('Model status failed:', e.message); res.status(500).json({ error:'Failed to get model status', message:e.message }); }
 });
 
-/**
- * Middleware to handle streaming responses and cleanup
- */
+// ---- 11. Stream cleanup middleware ---------------------------------------
 app.use((req, res, next) => {
-  let cleanupDone = false;
-
-  // Set up cleanup function that only runs once
+  let done = false;
   const cleanup = () => {
-    const modelToRelease = req.selectedModel;
-    if (modelToRelease && !cleanupDone) {
-      cleanupDone = true;
-      const index = inProgressModels.indexOf(modelToRelease);
-      if (index > -1) {
-        inProgressModels.splice(index, 1);
-        logger.debug(`Released model: ${modelToRelease}`);
-        logger.debug(`In-progress models: [${inProgressModels.join(', ')}]`);
+    if (!done && req.selectedModel) {
+      done = true;
+      const idx = inProgressModels.indexOf(req.selectedModel);
+      if (idx > -1) {
+        inProgressModels.splice(idx, 1);
+        logger.debug(`Released model: ${req.selectedModel}`);
+        logger.debug(`In‑progress now: [${inProgressModels.join(', ')}]`);
       }
     }
   };
 
-  // Listen for various events that indicate the response is complete
-  res.on('close', () => {
-    if (config.ENABLE_REQUEST_LOGGING) {
-      logger.debug(`Client connection closed for request: ${req.url}`);
-    }
-    cleanup();
-  });
+  res.on('close', () => { if (config.ENABLE_REQUEST_LOGGING) logger.debug(`Client closed: ${req.url}`); cleanup(); });
+  res.on('finish', () => { if (config.ENABLE_REQUEST_LOGGING) logger.debug(`Response finished: ${req.url}`); cleanup(); });
+  res.on('error', e => { logger.error(`Stream error on ${req.url}:`, e.message); cleanup(); });
 
-  res.on('finish', () => {
-    if (config.ENABLE_REQUEST_LOGGING) {
-      logger.debug(`Stream finished for request: ${req.url}`);
-    }
-    cleanup();
-  });
+  const origEnd = res.end;
+  res.end = function(chunk, enc) { cleanup(); origEnd.call(this, chunk, enc); };
 
-  res.on('error', (error) => {
-    logger.error(`Stream error for request: ${req.url}:`, error.message);
-    cleanup();
-  });
-
-  // Override res.end as a fallback (in case the above events don't fire)
-  const originalEnd = res.end;
-  res.end = function(chunk, encoding) {
-    cleanup();
-    originalEnd.call(this, chunk, encoding);
-  };
-
-  // Set streaming headers for all responses
+  // common headers
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -303,95 +269,56 @@ app.use((req, res, next) => {
   next();
 });
 
-// Proxy configuration
+// ---- 12. Main proxy -------------------------------------------------------
 app.use(proxy(config.LM_STUDIO_URL, {
-  proxyReqBodyDecorator: (bodyContent, srcReq) => {
-    const modifiedBody = modifyRequestBody(bodyContent, srcReq);
-    if (config.ENABLE_REQUEST_LOGGING) {
-      logger.info(`Request URL: ${srcReq.url}`);
-    }
-    return modifiedBody;
+  proxyReqBodyDecorator: (body, src) => {
+    const mod = modifyRequestBody(body, src);
+    if (config.ENABLE_REQUEST_LOGGING) logger.info(`Proxying ${src.url}`);
+    return mod;
   },
-  proxyReqOptDecorator: (proxyReqOpts, srcReq) => {
-    // Preserve headers for streaming
-    proxyReqOpts.headers['Accept'] = 'text/event-stream';
-    proxyReqOpts.headers['Cache-Control'] = 'no-cache';
-    proxyReqOpts.headers['Connection'] = 'keep-alive';
-
-    // Remove Content-Length header to let proxy calculate it automatically
-    delete proxyReqOpts.headers['content-length'];
-
-    // Set timeout for large requests
-    proxyReqOpts.timeout = config.REQUEST_TIMEOUT;
-
-    return proxyReqOpts;
+  proxyReqOptDecorator: (opts, src) => {
+    opts.headers['Accept']            = 'text/event-stream';
+    opts.headers['Cache-Control']     = 'no-cache';
+    opts.headers['Connection']        = 'keep-alive';
+    delete opts.headers['content-length'];
+    opts.timeout = config.REQUEST_TIMEOUT;
+    return opts;
   },
-
-  // Add error handling for large payloads
   proxyErrorHandler: (err, res, next) => {
     logger.error('Proxy error:', err.message);
-    
     if (err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT') {
-      res.status(504).json({ 
-        error: 'Gateway timeout - request too large or took too long',
-        code: err.code 
-      });
+      res.status(504).json({ error:'Gateway timeout', code: err.code });
     } else if (err.message.includes('PayloadTooLargeError')) {
-      res.status(413).json({ 
-        error: 'Request entity too large',
-        code: 'PAYLOAD_TOO_LARGE'
-      });
+      res.status(413).json({ error:'Request entity too large', code:'PAYLOAD_TOO_LARGE' });
     } else {
-      res.status(500).json({ 
-        error: 'Proxy error', 
-        message: err.message,
-        code: err.code || 'UNKNOWN_ERROR'
-      });
+      res.status(500).json({ error:'Proxy error', message: err.message, code: err.code || 'UNKNOWN_ERROR' });
     }
   }
 }));
 
-/**
- * Starts the load balancer server
- */
+// ---- 13. Server startup -------------------------------------------------
 async function startServer() {
   try {
     await loadModels();
-
-    if (availableModels.length === 0) {
-      logger.warn('No models currently loaded in LM Studio. Server will start and continue checking for models.');
-    }
+    if (!availableModels.length) logger.warn('No embedding models loaded – server will start and keep polling');
 
     app.listen(config.LOAD_BALANCER_PORT, () => {
-      logger.info(`Load balancer server running on port ${config.LOAD_BALANCER_PORT}`);
-      logger.info(`Proxying requests to LM Studio at ${config.LM_STUDIO_URL}`);
+      logger.info(`Load‑balancer listening on ${config.LOAD_BALANCER_PORT}`);
+      logger.info(`Proxying to LM Studio at ${config.LM_STUDIO_URL}`);
 
-      if (availableModels.length > 0) {
-        logger.info(`Available models: [${availableModels.map(m => m.id).join(', ')}]`);
-      } else {
-        logger.info('No models currently available. Models will be detected automatically when loaded.');
+      if (availableModels.length) {
+        logger.info(`Embedding models: [${availableModels.map(m=>m.id).join(', ')}]`);
       }
 
-      // Start periodic model updates
       startModelUpdater();
-      logger.info(`Model updater started - checking for new models every ${config.MODEL_REFRESH_INTERVAL}ms`);
+      logger.info(`Started model updater – refresh every ${config.MODEL_REFRESH_INTERVAL} ms`);
     });
-  } catch (error) {
-    logger.error('Failed to start server:', error.message);
-    process.exit(1);
-  }
+  } catch (e) { logger.error('Failed to start server:', e.message); process.exit(1); }
 }
 
-// Handle graceful shutdown
-process.on('SIGTERM', () => {
-  logger.info('Received SIGTERM, shutting down gracefully');
-  process.exit(0);
-});
+// ---- 14. Graceful shutdown --------------------------------------------
+process.on('SIGTERM', () => { logger.info('SIGTERM received – shutting down'); process.exit(0); });
+process.on('SIGINT',  () => { logger.info('SIGINT received – shutting down'); process.exit(0); });
 
-process.on('SIGINT', () => {
-  logger.info('Received SIGINT, shutting down gracefully');
-  process.exit(0);
-});
-
-// Start the server
+// ---- 15. Kick‑off --------------------------------------------------------
 startServer();
